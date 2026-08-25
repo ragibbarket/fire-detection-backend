@@ -2,9 +2,10 @@ const express = require("express");
 const router = express.Router();
 const Reading = require("../models/Reading");
 const Alert = require("../models/Alert");
-const Verifier = require("../models/Verifier");
+const DeviceMembership = require("../models/DeviceMembership");
 const { predictFire } = require("../services/mlService");
 const { generateVerificationToken, sendVerificationEmails } = require("../services/emailService");
+const { requireAuth } = require("../middleware/auth");
 
 // POST /api/sensor-data - ESP32 posts a new reading here
 router.post("/", async (req, res) => {
@@ -77,16 +78,21 @@ router.post("/", async (req, res) => {
       verificationExpiresAt: new Date(Date.now() + 15 * 60 * 1000), // 15 min
     });
 
-    const verifiers = await Verifier.find();
-    if (verifiers.length === 0) {
+    const memberships = await DeviceMembership.find({ device: deviceId, status: "active" }).populate(
+      "user",
+      "name email"
+    );
+    const recipients = memberships.map((m) => ({ name: m.user.name, email: m.user.email }));
+
+    if (recipients.length === 0) {
       console.warn(
-        `[email] No verifiers registered - no emails sent for alert ${alert._id}. ` +
-        `Add one with: POST /api/verifiers { "name": "...", "email": "..." }`
+        `[email] No active users registered for device "${deviceId}" - no emails sent for alert ${alert._id}. ` +
+        `Register an owner with POST /api/auth/register-owner first.`
       );
     } else {
       try {
-        await sendVerificationEmails(alert, reading, verifiers);
-        console.log(`[email] Verification emails sent to ${verifiers.map((v) => v.email).join(", ")}`);
+        await sendVerificationEmails(alert, reading, recipients);
+        console.log(`[email] Verification emails sent to ${recipients.map((r) => r.email).join(", ")}`);
       } catch (emailErr) {
         // don't let an email failure break the alert/reading response -
         // the alert still exists and can be verified from the dashboard
@@ -121,7 +127,7 @@ router.get("/latest", async (req, res) => {
 // become an Alert, so there'd be no way to teach the model "this WAS a
 // real fire" from it. This is the primary source (along with verified
 // alerts) that GET /api/alerts/training-data exports for retraining.
-router.post("/:readingId/label", async (req, res) => {
+router.post("/:readingId/label", requireAuth, async (req, res) => {
   try {
     const { label } = req.body;
     if (!["fire", "false_alarm"].includes(label)) {

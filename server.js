@@ -9,7 +9,8 @@ const sensorRoutes = require("./routes/sensorRoutes");
 const alertRoutes = require("./routes/alertRoutes");
 const verifyRoutes = require("./routes/verifyRoutes");
 const fireStationRoutes = require("./routes/fireStationRoutes");
-const verifierRoutes = require("./routes/verifierRoutes");
+const authRoutes = require("./routes/authRoutes");
+const deviceRoutes = require("./routes/deviceRoutes");
 
 const app = express();
 const server = http.createServer(app);
@@ -24,7 +25,8 @@ app.use("/api/sensor-data", sensorRoutes);
 app.use("/api/alerts", alertRoutes);
 app.use("/api/verify", verifyRoutes);
 app.use("/api/fire-stations", fireStationRoutes);
-app.use("/api/verifiers", verifierRoutes);
+app.use("/api/auth", authRoutes);
+app.use("/api/devices", deviceRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "Fire detection backend is running" });

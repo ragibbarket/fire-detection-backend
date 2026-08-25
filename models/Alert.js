@@ -18,7 +18,7 @@ const alertSchema = new mongoose.Schema(
     // human verification (email -> app link -> verify)
     verificationToken: { type: String, default: null },
     verificationExpiresAt: { type: Date, default: null },
-    verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Verifier", default: null },
+    verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
     verifiedAt: { type: Date, default: null },
     resolvedAt: { type: Date, default: null },
 

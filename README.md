@@ -39,6 +39,30 @@ and takes 30-60s to wake on the next request. If the ESP32 posts every
 30s, that traffic alone keeps it awake during active testing - just expect
 a slow first response after any idle gap (e.g. first thing on defense day).
 
+## Authentication & team setup
+
+Real accounts now, not a standalone email list - JWT auth, bcrypt-hashed
+passwords, and device membership (owner + up to 5 active users total).
+
+1. **Register the device's first owner** (do this once):
+   ```bash
+   curl -X POST http://localhost:5000/api/auth/register-owner -H "Content-Type: application/json" -d "{\"deviceId\": \"esp32-01\", \"name\": \"Your Name\", \"email\": \"you@gmail.com\", \"password\": \"a-strong-password\"}"
+   ```
+   Returns a JWT - the dashboard's login page does this same call under
+   "First-time setup" if you'd rather use the UI.
+2. **Owner invites up to 4 more people** from the dashboard's Team page
+   (or `POST /api/devices/:deviceId/invite`). They get an email with a
+   link to set their own password and join.
+3. **Everyone who's an active member** can verify alerts, resolve them,
+   and notify fire stations - identical access. **Only the owner** can
+   invite or remove people.
+4. Removing someone (`DELETE /api/devices/:deviceId/members/:userId`) is
+   permanent and immediately frees their slot for a new invite.
+
+This replaces the old standalone `Verifier` model entirely - fire alert
+emails now go to the device's active members, and `alert.verifiedBy`
+records a real `User`.
+
 ## Setup
 
 ```bash
@@ -52,15 +76,11 @@ npm run dev             # nodemon, auto-restart on changes
 see a FAILED message instead, `EMAIL_USER`/`EMAIL_PASS` in `.env` are wrong
 (most likely `EMAIL_PASS` is not a 16-character Gmail App Password).
 
-**No fire alert emails will send until at least one verifier is
-registered.** Add one with:
-```bash
-curl -X POST http://localhost:5000/api/verifiers -H "Content-Type: application/json" -d "{\"name\": \"Your Name\", \"email\": \"you@gmail.com\"}"
-```
-Repeat for all 3 verifiers. Check who's registered with `GET /api/verifiers`.
-If a fire alert fires with zero verifiers registered, the terminal logs a
-warning and no email is sent (the alert still shows up on the dashboard and
-can be verified there instead).
+**No fire alert emails will send until the device has at least one active
+user** - see "Authentication & team setup" above (register the owner
+first, then invite others). If a fire alert fires with zero active users,
+the terminal logs a warning and no email is sent (the alert still shows up
+on the dashboard and can be verified there instead).
 
 **Fire station "Notify" list will be empty until you register at least one
 station too:**
@@ -75,12 +95,13 @@ Repeat for each station you want available. Check with `GET /api/fire-stations`.
 ESP32 (sensors) --> POST /api/sensor-data --> MongoDB (Reading)
                                             --> if suspicious: call ML service
                                             --> ML says fire: Alert (pending_verification)
-                                                --> email 3 verifiers with a review link
+                                                --> email the device's active users with a review link
                                             --> ML says false alarm: Alert (false_alarm), no email
 
-Verifier clicks email link --> GET /api/verify/:alertId?token=..  (loads alert for review)
-                             --> POST /api/verify/:alertId        (confirmed | false_alarm)
-                                 --> confirmed: Alert.status = verified_fire
+User clicks email link --> GET /api/verify/:alertId?token=..  (loads alert for review)
+                         --> POST /api/verify/:alertId        (confirmed | false_alarm)
+                             --> confirmed: Alert.status = verified_fire
+(any active device user can also do this from the dashboard, via JWT login instead of the token)
 
 App shows nearby fire stations --> GET /api/fire-stations?lat=..&lng=..
 User taps a station            --> POST /api/fire-stations/:id/notify
@@ -133,11 +154,11 @@ alongside verified alerts.
 All alerts, most recent first, with the related reading populated.
 
 ### `POST /api/alerts/:id/dashboard-verify`
-Body: `{ decision: "confirmed" | "false_alarm", verifierEmail }`. Web-dashboard
-equivalent of the email-link verify flow - no token needed, but still
-requires picking which registered verifier is confirming, so there's an
-accountable human decision before a fire station is notified. Rejects
-alerts not currently in `pending_verification`.
+Body: `{ decision: "confirmed" | "false_alarm" }`. Requires
+`Authorization: Bearer <token>`. Web-dashboard equivalent of the
+email-link verify flow - identity comes from the JWT, and the caller must
+be an active member of the device the alert belongs to. Rejects alerts
+not currently in `pending_verification`.
 
 ### `GET /api/alerts/status?deviceId=esp32-01`
 Returns `{ status, mlPrediction, buzzerShouldSound }` for the given device.
@@ -162,18 +183,32 @@ from BOTH alert verification (dashboard/email) AND direct manual labeling
 unverified predictions. Used by the ML service's automatic retraining
 scheduler (see `ml-service/README.md`).
 
-### `GET /api/verifiers`
-Lists registered verifiers (name, email) for the dashboard's "verifying as" picker.
+### Auth & device endpoints
+
+- `POST /api/auth/register-owner` - `{ deviceId, name, email, password }` -
+  bootstraps the first owner. Fails if the device already has one.
+- `POST /api/auth/login` - `{ email, password }` -> `{ token, user, memberships }`
+- `POST /api/auth/accept-invite` - `{ token, name, password }` - invited
+  person sets up their account and becomes an active member.
+- `GET /api/devices/:deviceId/members` - any active member can view the team.
+- `POST /api/devices/:deviceId/invite` - **owner only**, `{ email }`.
+  Rejects if the device already has 5 active users.
+- `DELETE /api/devices/:deviceId/members/:userId` - **owner only**,
+  permanent removal, frees their slot.
+
+All of the above except register-owner/login/accept-invite require
+`Authorization: Bearer <token>`.
 
 ### `GET /api/verify/:alertId?token=...`
-Called when a verifier opens the email link. Returns the alert + reading so
-the app/web can render the review screen. Fails if the token is wrong,
-expired, or the alert was already reviewed.
+Called when someone opens the emailed review link (no login needed - the
+token itself is the credential). Returns the alert + reading so the app/web
+can render the review screen. Fails if the token is wrong, expired, or the
+alert was already reviewed.
 
 ### `POST /api/verify/:alertId`
 Body: `{ token, decision: "confirmed" | "false_alarm", verifierEmail }`.
-Records which of the 3 verifiers responded and moves the alert to
-`verified_fire` or `false_alarm`.
+`verifierEmail` must belong to a registered User who is an active member of
+the device. Moves the alert to `verified_fire` or `false_alarm`.
 
 ### `GET /api/fire-stations?lat=..&lng=..`
 Returns the fire station directory, sorted nearest-first if coordinates are given.

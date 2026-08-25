@@ -1,17 +1,25 @@
 const express = require("express");
 const router = express.Router();
 const Alert = require("../models/Alert");
-const Verifier = require("../models/Verifier");
 const Reading = require("../models/Reading");
+const DeviceMembership = require("../models/DeviceMembership");
+const { requireAuth } = require("../middleware/auth");
 
 // GET /api/alerts - alert history for dashboard, most recent first
-router.get("/", async (req, res) => {
-  const alerts = await Alert.find().sort({ createdAt: -1 }).populate("reading").populate("notifiedStation");
+router.get("/", requireAuth, async (req, res) => {
+  const alerts = await Alert.find()
+    .sort({ createdAt: -1 })
+    .populate("reading")
+    .populate("notifiedStation")
+    .populate("verifiedBy", "name email");
   res.json(alerts);
 });
 
 // GET /api/alerts/status?deviceId=esp32-01
-// Lightweight endpoint for the ESP32 to POLL (every few seconds).
+// Lightweight endpoint for the ESP32 to POLL (every few seconds). Not
+// behind auth - the device itself can't practically do a JWT login, and
+// this only ever reveals a boolean + a status string for a device it
+// already knows its own deviceId for.
 //
 // buzzerShouldSound is computed server-side so the ESP32 just needs to
 // read one boolean - no verification-flow knowledge needed on the device:
@@ -57,17 +65,12 @@ router.get("/status", async (req, res) => {
 
 // GET /api/alerts/training-data
 // Exports every reading with a HUMAN-SET GROUND TRUTH LABEL as a labeled
-// dataset for the ML service to retrain on. This is intentionally NOT
-// scoped to "alerts that got verified" - a reading only becomes an Alert
-// if it crosses the basic suspicion threshold or the ML already thinks
-// it's fire, so a small real test (e.g. a lighter held to the flame
-// sensor, flame=true but smoke/temp too low to look "suspicious") would
-// never get an Alert and therefore never get corrected. Reading.humanLabel
-// can be set two ways, both count here:
+// dataset for the ML service to retrain on. Reading.humanLabel can be set
+// two ways, both count here:
 //   1. Verifying an Alert (dashboard or email link) also stamps the label
 //      onto its linked reading.
-//   2. POST /api/sensor-data/:readingId/label - direct manual labeling of
-//      ANY reading, used specifically for that small-scale-test gap above.
+//   2. POST /api/sensor-data/:readingId/label - direct manual labeling.
+// Not behind auth - called by the ML service, not a browser session.
 router.get("/training-data", async (req, res) => {
   const readings = await Reading.find({ humanLabel: { $ne: null } }).select(
     "flameDetected smokeValue temperature humidity humanLabel humanLabeledAt"
@@ -86,51 +89,59 @@ router.get("/training-data", async (req, res) => {
 });
 
 // GET /api/alerts/:id
-router.get("/:id", async (req, res) => {
-  const alert = await Alert.findById(req.params.id).populate("reading").populate("notifiedStation");
+router.get("/:id", requireAuth, async (req, res) => {
+  const alert = await Alert.findById(req.params.id)
+    .populate("reading")
+    .populate("notifiedStation")
+    .populate("verifiedBy", "name email");
   if (!alert) return res.status(404).json({ error: "Alert not found" });
   res.json(alert);
 });
 
 // POST /api/alerts/:id/dashboard-verify
-// Body: { decision: "confirmed" | "false_alarm", verifierEmail }
+// Body: { decision: "confirmed" | "false_alarm" }
 //
-// This is the web-dashboard equivalent of the email-link verify flow
-// (routes/verifyRoutes.js). It skips the token check because it's meant
-// to be used by staff directly on the monitoring dashboard, not from an
-// emailed link - but it still requires picking WHO is verifying
-// (verifierEmail, matched against the Verifier collection) so there's an
-// accountable human decision on record before a fire station gets notified.
-router.post("/:id/dashboard-verify", async (req, res) => {
+// Web-dashboard equivalent of the email-link verify flow. The verifier's
+// identity comes from the JWT (req.user), not a manually-picked name, and
+// they must be an ACTIVE member of the device the alert's reading belongs
+// to - any active member can do this (owner-only is just invite/remove,
+// see routes/deviceRoutes.js).
+router.post("/:id/dashboard-verify", requireAuth, async (req, res) => {
   try {
-    const { decision, verifierEmail } = req.body;
-
+    const { decision } = req.body;
     if (!["confirmed", "false_alarm"].includes(decision)) {
       return res.status(400).json({ error: "decision must be 'confirmed' or 'false_alarm'" });
     }
 
-    const alert = await Alert.findById(req.params.id);
+    const alert = await Alert.findById(req.params.id).populate("reading");
     if (!alert) return res.status(404).json({ error: "Alert not found" });
     if (alert.status !== "pending_verification") {
       return res.status(409).json({ error: "This alert is not awaiting verification" });
     }
 
-    const verifier = verifierEmail ? await Verifier.findOne({ email: verifierEmail }) : null;
+    const membership = await DeviceMembership.findOne({
+      device: alert.reading.deviceId,
+      user: req.user.userId,
+      status: "active",
+    });
+    if (!membership) return res.status(403).json({ error: "You are not an active user of this device" });
 
     alert.status = decision === "confirmed" ? "verified_fire" : "false_alarm";
-    alert.verifiedBy = verifier ? verifier._id : null;
+    alert.verifiedBy = req.user.userId;
     alert.verifiedAt = new Date();
     await alert.save();
 
     // stamp the same ground truth onto the linked reading, so
     // /training-data picks it up regardless of which path set it
-    await Reading.findByIdAndUpdate(alert.reading, {
+    await Reading.findByIdAndUpdate(alert.reading._id, {
       humanLabel: decision === "confirmed" ? "fire" : "false_alarm",
       humanLabeledAt: alert.verifiedAt,
     });
 
-    // re-fetch populated so the frontend keeps the reading data it already had
-    const populatedAlert = await Alert.findById(alert._id).populate("reading").populate("notifiedStation");
+    const populatedAlert = await Alert.findById(alert._id)
+      .populate("reading")
+      .populate("notifiedStation")
+      .populate("verifiedBy", "name email");
 
     const io = req.app.get("io");
     io.emit("alert:verified", populatedAlert);
@@ -144,23 +155,31 @@ router.post("/:id/dashboard-verify", async (req, res) => {
 
 // POST /api/alerts/:id/resolve
 // Manual override, only available after a human confirmed real fire
-// (status "verified_fire" or "notified"). Silences the buzzer immediately
-// via the /status polling endpoint - use once the situation is actually
-// handled. If the next reading is still fire-like, a new alert will
-// naturally re-trigger the buzzer (this doesn't disable the device).
-router.post("/:id/resolve", async (req, res) => {
+// (status "verified_fire" or "notified"). Any active member of the
+// device can resolve - same access level as verifying.
+router.post("/:id/resolve", requireAuth, async (req, res) => {
   try {
-    const alert = await Alert.findById(req.params.id);
+    const alert = await Alert.findById(req.params.id).populate("reading");
     if (!alert) return res.status(404).json({ error: "Alert not found" });
     if (!["verified_fire", "notified"].includes(alert.status)) {
       return res.status(409).json({ error: "Only a verified fire alert can be resolved" });
     }
 
+    const membership = await DeviceMembership.findOne({
+      device: alert.reading.deviceId,
+      user: req.user.userId,
+      status: "active",
+    });
+    if (!membership) return res.status(403).json({ error: "You are not an active user of this device" });
+
     alert.status = "resolved";
     alert.resolvedAt = new Date();
     await alert.save();
 
-    const populatedAlert = await Alert.findById(alert._id).populate("reading").populate("notifiedStation");
+    const populatedAlert = await Alert.findById(alert._id)
+      .populate("reading")
+      .populate("notifiedStation")
+      .populate("verifiedBy", "name email");
 
     const io = req.app.get("io");
     io.emit("alert:resolved", populatedAlert);

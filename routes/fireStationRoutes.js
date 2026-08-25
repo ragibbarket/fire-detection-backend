@@ -2,7 +2,9 @@ const express = require("express");
 const router = express.Router();
 const FireStation = require("../models/FireStation");
 const Alert = require("../models/Alert");
+const DeviceMembership = require("../models/DeviceMembership");
 const { buildFireAlertLink } = require("../services/whatsappService");
+const { requireAuth } = require("../middleware/auth");
 
 // haversine distance in km, used to sort stations by proximity to the device
 function distanceKm(lat1, lon1, lat2, lon2) {
@@ -51,7 +53,7 @@ router.post("/", async (req, res) => {
 // POST /api/fire-stations/:id/notify - body: { alertId }
 // No WhatsApp API is called here. This builds a wa.me link with the alert
 // details pre-filled; the frontend opens it and a human taps send.
-router.post("/:id/notify", async (req, res) => {
+router.post("/:id/notify", requireAuth, async (req, res) => {
   try {
     const { alertId } = req.body;
     const station = await FireStation.findById(req.params.id);
@@ -62,6 +64,13 @@ router.post("/:id/notify", async (req, res) => {
     if (alert.status !== "verified_fire") {
       return res.status(409).json({ error: "This alert has not been verified as a real fire yet" });
     }
+
+    const membership = await DeviceMembership.findOne({
+      device: alert.reading.deviceId,
+      user: req.user.userId,
+      status: "active",
+    });
+    if (!membership) return res.status(403).json({ error: "You are not an active user of this device" });
 
     const { message, waLink } = buildFireAlertLink(station.whatsappNumber, {
       deviceId: alert.reading.deviceId,

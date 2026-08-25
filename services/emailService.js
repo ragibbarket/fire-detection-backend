@@ -56,4 +56,27 @@ async function sendVerificationEmails(alert, reading, verifiers) {
   await Promise.all(sendPromises);
 }
 
-module.exports = { generateVerificationToken, sendVerificationEmails };
+/**
+ * Emails an invited person a link to accept their device invitation
+ * (set their name + password, then become an active member).
+ */
+async function sendInviteEmail(invitation) {
+  const inviteUrl = `${process.env.APP_INVITE_URL}?token=${invitation.token}`;
+
+  const html = `
+    <h2>You've been invited to a Fire Detection device</h2>
+    <p>Device: ${invitation.device}</p>
+    <p>You'll be able to see live sensor data, verify fire alerts, and notify fire stations.</p>
+    <p><a href="${inviteUrl}">Accept invitation and set up your account</a></p>
+    <p>This link expires in 48 hours.</p>
+  `;
+
+  await transporter.sendMail({
+    from: process.env.EMAIL_FROM,
+    to: invitation.email,
+    subject: "You're invited to a Fire Detection device",
+    html,
+  });
+}
+
+module.exports = { generateVerificationToken, sendVerificationEmails, sendInviteEmail };
